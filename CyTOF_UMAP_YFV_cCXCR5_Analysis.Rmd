@@ -1,0 +1,2638 @@
+---
+title: "YFV CyTOF data analysis"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(stringr)
+library(flowCore)
+library(dplyr)
+library(ggplot2); theme_set(theme_bw(20) +
+          theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black")))
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(ggthemes)
+library(reshape2)
+library(circlize) #for colorRamp2 function
+library(Rtsne)
+library(viridis)
+#library(cytofkit)
+library(ggbeeswarm)
+library(xtable)
+library(readxl)
+library(reticulate)
+library(umap)
+library(gtools)
+library(Rphenograph)
+library(tidyr)
+
+options(stringsAsFactors = FALSE)
+
+opts_chunk$set(fig.width=6, fig.height=4.25, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE)
+#opts_knit$set(root.dir = "/Users/hdeberg/Box") #new machine
+#opts_knit$set(root.dir = "/Users/hannahdeberg/Box Sync") #old machine
+#setwd("/Users/hdeberg/Box")
+#opts_knit$set(root.dir = "/home/hdeberg/")
+options(stringsAsFactors = FALSE)
+
+##Run Rmarkdown from command line: 
+#R -e "rmarkdown::render('ITN043_AnalysisWithStudyKey/TimothyGrassCyTOFAnalysis.Rmd',output_file='TimothyGrassCyTOF.pdf')"
+```
+
+```{r load_saved_results_get_filenames}
+load("~/Box/YFV Study/Hannah/UMAP_Analysis/YFV_CyTOF_UMAP_20190422.RData")
+
+#There is no key, so subject, day, other information needs to be parsed from the filenames
+base_dir <- "/Users/hdeberg/Box/YFV Study" # new machine
+#base_dir <- "/Users/hannahdeberg/Box Sync/YFV Study" #older laptop
+plot_dir <- file.path(base_dir, "Hannah", "UMAP_Analysis", "UMAP_plots")
+cxcr5_dir <- file.path(base_dir, "Hannah", "Kwok and DeGottardi - YFV CXCR5 Export")
+
+#Open the file with percent postive results from Quinn
+pct_positive <- read.csv(file.path(base_dir, "Hannah", "YFV_percent_positive_long_format.csv"))
+
+```
+
+```{r process_data}
+subjects <- c("YFV023","YFV024","YFV025","YFV026","YFV027","YFV028","YFV029","YFV030","YFV031")
+
+subject_folders <- sapply(subjects, function(x) file.path(base_dir, x))
+subject_folders_cxcr5 <- sapply(subjects, function(x) file.path(cxcr5_dir, x))
+
+#Parse the annotation (day, subject, tmr) from file names
+get_anno_from_filenames <- function (subject_folder){
+  #List all files in the folder
+  fcs_files <- list.files(subject_folder, full.names = T, recursive = T) 
+  #Get the subject and day from the file name
+  subject <- str_extract(fcs_files, "YFV0[0-9][0-9]")
+  day <- str_extract(fcs_files, "D[0-9]+|1YR") 
+  #Getting the tmr event type takes a little more work since there is some inconsistency in naming
+  #If the word subset is present, remove it from the file name
+  simplified_fn <- str_replace_all(fcs_files, "subset","")
+  #Remove blank spaces 
+  simplified_fn <- str_replace_all(simplified_fn, fixed(" "), "")
+  #Replace  + with pos
+  simplified_fn <- str_replace_all(simplified_fn, fixed("+"), "pos")
+  
+  
+  #Search for tetramer type
+  tet_type <- ifelse(str_detect(simplified_fn, "163pos")&str_detect(simplified_fn, "164pos"), "envp8",
+                    ifelse(str_detect(simplified_fn, "163pos")&str_detect(simplified_fn, "173pos"), "tt",
+                           ifelse(str_detect(simplified_fn, "164pos")&str_detect(simplified_fn, "175pos"), "rv",
+                                  ifelse(str_detect(simplified_fn, "168pos")&str_detect(simplified_fn, "169pos"), "ns1",
+                                         ifelse(str_detect(simplified_fn, "168pos")&str_detect(simplified_fn, "175pos"), "ebv",
+                                                ifelse(str_detect(simplified_fn, "169pos")&str_detect(simplified_fn, "171pos"), "flu",
+                                                       ifelse(str_detect(simplified_fn, "171pos")&str_detect(simplified_fn, "173pos"), "ns3", 
+                                                              ifelse(str_detect(simplified_fn, "pre"), "pre","other"))))))))
+  
+  #Store the subject, day, tmr, and file names in an dataframe
+  anno_df <- data.frame("subject" = subject,
+                        "day" = day,
+                        "tmr" = tet_type,
+                        "file" = fcs_files)
+  
+  return(anno_df)
+}
+
+#Run the annotation extraction function over all files in the subject folders                  
+anno <- lapply(subject_folders, get_anno_from_filenames)
+
+get_cxcr5_anno_from_filenames <- function (subject_folder){
+  #List all files in the folder
+  fcs_files <- list.files(subject_folder, full.names = T, recursive = T) 
+  #Get the subject and day from the file name
+  subject <- str_extract(fcs_files, "YFV0[0-9][0-9]")
+  day <- str_extract(fcs_files, "D[0-9]+|1YR") 
+  #Getting the tmr event type takes a little more work since there is some inconsistency in naming
+  #If the word subset is present, remove it from the file name
+  simplified_fn <- str_replace_all(fcs_files, "subset","")
+  #Remove blank spaces 
+  simplified_fn <- str_replace_all(simplified_fn, fixed(" "), "")
+  #Replace  + with pos
+  simplified_fn <- str_replace_all(simplified_fn, fixed("+"), "pos")
+  
+  #Search for tetramer type
+  tet_type <- ifelse(str_detect(simplified_fn, "163")&str_detect(simplified_fn, "164"), "envp8",
+                    ifelse(str_detect(simplified_fn, "163")&str_detect(simplified_fn, "173"), "tt",
+                           ifelse(str_detect(simplified_fn, "164")&str_detect(simplified_fn, "175"), "rv",
+                                  ifelse(str_detect(simplified_fn, "168")&str_detect(simplified_fn, "169"), "ns1",
+                                         ifelse(str_detect(simplified_fn, "168")&str_detect(simplified_fn, "175"), "ebv",
+                                                       ifelse(str_detect(simplified_fn, "171")&str_detect(simplified_fn, "173"), "ns3", 
+                                                              ifelse(str_detect(simplified_fn, "pre"), "pre","other")))))))) 
+  
+  #Store the subject, day, tmr, and file names in an dataframe
+  anno_df <- data.frame("subject" = subject,
+                        "day" = day,
+                        "tmr" = tet_type,
+                        "file" = fcs_files)
+  
+  return(anno_df)
+}
+anno_cxcr5 <- lapply(subject_folders_cxcr5, get_cxcr5_anno_from_filenames)
+
+#Make anno a dataframe instead of a list 
+#This contains each file name and the subject, day, tmr information 
+anno <- Reduce(function(x, y) merge(x, y, all=TRUE), anno)
+anno_cxcr5 <- Reduce(function(x, y) merge(x, y, all=TRUE), anno_cxcr5)
+
+#There was one file name error in the cxcr5 files
+# anno$file[anno$tmr == "other"] returns 
+#  "/Users/hdeberg/Box/YFV Study/Hannah/Kwok and DeGottardi - YFV CXCR5 Export/YFV026/export_YFV026 D60 post_CD45RO CXCR5, tet163 163 subset.fcs"
+
+#This file should be an envp8 file
+#Use for new computer
+anno_cxcr5$tmr[anno_cxcr5$file == "/Users/hdeberg/Box/YFV Study/Hannah/Kwok and DeGottardi - YFV CXCR5 Export/YFV026/export_YFV026 D60 post_CD45RO CXCR5, tet163 163 subset.fcs"] <- "envp8"
+
+#Use for older laptop
+#anno_cxcr5$tmr[anno_cxcr5$file == "/Users/hannahdeberg/Box Sync/YFV Study/Hannah/Kwok and DeGottardi - YFV CXCR5 Export/YFV026/export_YFV026 D60 post_CD45RO CXCR5, tet163 163 subset.fcs"] <- "envp8"
+
+#Set up additional annotaiton combining envp8, ns1, ns3 into a yfv group
+anno$tmr_group <- anno$tmr
+anno$tmr_group[anno$tmr %in% c("envp8", "ns1", "ns3")] <- "yfv"
+
+anno_cxcr5$tmr_group <- "yfv" #All cxcr5+ cell files  are yfv-specific
+###Get tetramer positive events and annotation
+
+#Read in all of the tmr+ events into a list
+#The events labeled "pre" are pre-enrichment and total CD4+, exclude these for now
+tmr_fcs <- lapply(anno$file[anno$tmr != "pre"], function(x) read.FCS(x, transformation = FALSE))
+
+#Subset the annotation data frame to tmr+ events
+anno_tmr <- anno[anno$tmr != "pre",]
+  
+#Get the metal/marker protein correspondence data
+tmr_key <- lapply(tmr_fcs, function(x) pData(parameters(x)))
+
+# #Get all possible marker and fluorophore combinations
+# tmr_summary <- tmr_key %>% Reduce(function(x,y) dplyr::full_join(x,y), .) #Generates some warnings that can be ignored
+# 
+# #Subset to marker metal names and descriptions(surface proteins) columns
+# tmr_summary <- tmr_summary[,c("name", "desc")]
+# 
+# #I like to check all possible marker and fluorophore combinatons
+# #This data is entered manually by the researcher, so there can be inconsistencies that need to be addressed
+# tmr_summary <- unique(tmr_summary)
+
+#Read in pre-enrichment cells into a list
+#Read in all of the tmr+ events into a single, large df
+pre_fcs <- lapply(anno$file[anno$tmr == "pre"], function(x) read.FCS(x, transformation = FALSE))
+anno_pre <- anno[anno$tmr == "pre",]
+
+#Get the metal/marker protein correspondence data
+pre_key <- lapply(pre_fcs, function(x) pData(parameters(x)))
+
+#Get all possible marker and fluorophore combinations
+pre_summary <- Reduce(function(x, y) merge(x, y, all=TRUE), pre_key)  
+pre_summary <- pre_summary[,c("name", "desc")]
+pre_summary <- unique(pre_summary)
+
+#Read in the cxcr5+ cells into a list
+cxcr5_fcs <- lapply(anno_cxcr5$file, function(x) read.FCS(x, transformation = FALSE))
+
+```
+
+```{r remove_subject027_flu}
+tmr_fcs <- tmr_fcs[!(anno_tmr$subject == "YFV027" & anno_tmr$tmr == "flu")]
+
+anno_tmr <- anno_tmr[!(anno_tmr$subject == "YFV027" & anno_tmr$tmr == "flu"),]
+```
+
+```{r set_up_colors}
+#This color scheme will be used in all subsequent plots
+n_subjects <- length(unique(anno_tmr$subject))
+subject_cols <- brewer.pal(n_subjects, "Set1")
+names(subject_cols)<- unique(anno_tmr$subject)
+
+n_days <- length(unique(anno_tmr$day))
+day_cols <- brewer.pal(8, "Dark2")[c(1,3,4,5,6,7,8)] #Color #2 looks like a tmr color
+names(day_cols)<- unique(anno_tmr$day)
+
+n_tmrs <- length(unique(anno_tmr$tmr))
+tmr_cols <- colorblind_pal()(8)[c(3,2,4,7,8,5,6)]
+names(tmr_cols)<- unique(anno_tmr$tmr)
+
+n_tmr_groups <- length(unique(anno_tmr$tmr_group))
+tmr_group_cols <- colorblind_pal()(8)[c(3,2,4,5,6)]
+names(tmr_group_cols)<- unique(anno_tmr$tmr_group)
+tmr_group_cols <- c(tmr_group_cols, "pre" = "#000000")
+
+rainbow_cols <- brewer.pal(11, "Spectral")[c(1,2,4,8,9,10,11)]
+
+```
+
+```{r select_markers_of_interest}
+#OX40 is suspect. It looks like there was the CyTOF equivalent of compensation issues
+#with this marker, so do not include it as a selected marker as it is up in both flu and ns3
+#specific cells at all times. OX40 is on YB172, flu and ns3 cells are YB171+, so this 
+#could be leaking into the OX40 channel. Do not use OX40 for dimensionality reduction
+
+selected_markers <- c("CCR4", "CCR6","CCR7","CD122","CD127","CD161",
+                      "CD25","CD27","CD38","CD39",
+                      "CD49D","CD62L","CD69","CD71",
+                      "CRTH2","CXCR3","CXCR5","ICOS",
+                      "PD1", "CD45RO", "CD45RA")
+```
+
+```{r read_and_process_data}
+#Check for metal names or marker descriptions that are duplicated,
+#this could indicate different metals 
+#were put on different markers in different experiments
+#It is also a good idea to visually check tmr_summary for any naming surprises
+
+#sum(duplicated(tmr_summary$desc[!is.na(tmr_summary$desc)])) 
+#sum(duplicated(tmr_summary$name)) 
+
+##Potential inconsistencies in this dataset
+#Sm147Di is associated with both CD20 and CD45RB
+#Nd146Di is associated with both CD8 and CD95
+
+#The CD45RB/CD95 notation is wrong according to Quinn
+#It is fixed in the code below
+
+#counter <- 0
+#Process data to clean up marker info and arcsin transform events
+process_data <- function(fcs){
+  
+  # Debugging: This code used to find problematic FCS files where all events are boundary events
+  # counter <<- counter + 1
+  # print(counter)
+
+  # Tidy marker names 
+  
+  #Get the marker information for an fcs file
+  marker_key <- pData(parameters(fcs))
+  
+  #Clean and standardize marker annotation
+  marker_key$desc <- str_to_upper(marker_key$desc)
+  marker_key$desc <- str_replace(marker_key$desc, "CD45RB","CD20") #Anything annotated CD45RB should be CD20
+  marker_key$desc <- str_replace(marker_key$desc, "CD95","CD8") #Anything annotated CD95 should be CD8
+  marker_key$desc <- ifelse(is.na(marker_key$desc), marker_key$name, marker_key$desc)
+  
+  #Replace with tidy names
+  pData(parameters(fcs)) <- marker_key
+  
+  # This changes parameters(fcs)$name, featureNames(fcs), and colnames(fcs) - aka events colnames - all in one fell swoop.
+  colnames(fcs) = make.names(pData(parameters(fcs))$desc)
+  
+  # Remove markers with multiple markers (i.e. all the NAs)
+  fcs = fcs[,!(duplicated(colnames(fcs)) | duplicated(colnames(fcs), fromLast = T))]
+  fcs = fcs[, order(colnames(fcs))]
+  
+  #Remove some columns that create issues and aren't needed for downstream analysis
+  fcs = fcs[,!(str_detect(colnames(fcs), "TIME|EVENT_LENGTH|CE140DI|Time|Event_length|Ce140Di"))]
+  
+  # Remove boundary events (those outside of FCS's range)
+  #Fails if there is only one event
+  #For FCS investigations, a z-score filter is needed, so this can be omitted
+  
+  # if(nrow(fcs) > 1){
+  #   fcs =  flowCore::Subset(fcs, flowCore::filter(fcs, boundaryFilter(x = selected_markers[1:2], tolerance = 0, side = "upper")))
+  # }
+  
+  #Get event info as a data frame
+  events <- as.data.frame(exprs(fcs))
+  
+  #arcsinh transform the events
+  arcsinh_trans <- apply(events, 2,arcsinhTransform(a=0, b = 1/5))
+  
+  #Special case - if there is only one event, force this to still be a data frame, not a vector
+  if(is.null(dim(arcsinh_trans))) {
+    arcsinh_trans <- as.data.frame(t(arcsinh_trans), col.nanmes = colnames(events))
+  } else{
+    arcsinh_trans <- as.data.frame(arcsinh_trans, col.names = colnames(events))
+  }
+  
+  return(arcsinh_trans)
+  
+}
+
+#Loop over all tmr positive fcs files
+tmr_arcsinh_trans <- lapply(tmr_fcs, process_data)
+
+#Read in pre-enrichment fcs data
+pre_arcsinh_trans <- lapply(pre_fcs, process_data)
+
+#Read in cxcr5+ gated cells
+cxcr5_arcsinh_trans <- lapply(cxcr5_fcs, process_data)
+#Some files had no cxcr5+ cells, remove these from the list of cxcr5 cells
+#and from the anno dataframe
+cxcr5_n_cells <- unlist(lapply(cxcr5_arcsinh_trans, nrow))
+cxcr5_n_col <- unlist(lapply(cxcr5_arcsinh_trans, ncol))
+
+cxcr5_n_cells[cxcr5_n_col == 0] <- 0
+
+anno_cxcr5 <- anno_cxcr5[cxcr5_n_cells != 0,]
+cxcr5_arcsinh_trans <- cxcr5_arcsinh_trans[cxcr5_n_cells != 0]
+  
+#Check that the columns of each tmr file are the same
+#common_columns <- Reduce(intersect, lapply(tmr_arcsinh_trans, colnames))
+#lapply(tmr_arcsinh_trans, function(x) ncol(x))
+
+#Get colnames which are markers 
+#All files have the same number of columns
+marker_colnames <- colnames(tmr_arcsinh_trans[[1]]) 
+#Make sure that the columns (markers) are in the same order in each list item
+tmr_arcsinh_trans <- lapply(tmr_arcsinh_trans, function(x) x[,marker_colnames])
+pre_arcsinh_trans <- lapply(pre_arcsinh_trans, function(x) x[,marker_colnames])
+cxcr5_arcsinh_trans <- lapply(cxcr5_arcsinh_trans, function(x) x[,marker_colnames])
+
+```
+
+
+```{r add_anno_to_events_list}
+add_anno_to_events <- function(events_list, anno_df){
+  events_list  <- mapply(cbind, events_list, "subject"=anno_df$subject, SIMPLIFY=F) 
+  events_list <- mapply(cbind, events_list, "day"=anno_df$day, SIMPLIFY=F)
+  events_list <- mapply(cbind, events_list, "tmr"=anno_df$tmr, SIMPLIFY=F)
+  events_list <- mapply(cbind, events_list, "tmr_group"=anno_df$tmr_group, SIMPLIFY=F)
+  
+  return(events_list)
+}
+
+tmr_arcsinh_trans <- add_anno_to_events(tmr_arcsinh_trans, anno_tmr)
+pre_arcsinh_trans <- add_anno_to_events(pre_arcsinh_trans, anno_pre)
+cxcr5_arcsinh_trans <- add_anno_to_events(cxcr5_arcsinh_trans, anno_cxcr5)
+```
+
+```{r set_heatmap_scale}
+#Use the pct positive data from Quinn to assign cells in each fcs file as postive or negative for a given marker 
+#The arcsin transformation is a monotonic increasing function, so it is safe to apply %'s to this to 
+#back-calculate gates
+
+#Match subject, day, marker with a fcs file
+
+pct_positive$donor <- str_to_upper(pct_positive$donor)
+pct_positive$marker <- str_to_upper(pct_positive$marker)
+
+pct_positive_spread <- spread(pct_positive, key = marker, value=percent_pos)
+
+add_pct_positive_data <- function(df_data){
+df_data$original_cell <- seq(1,nrow(df_data))
+
+for(marker_col in selected_markers){
+  data_for_marker <- df_data[,c("subject", "day", "tmr", "original_cell",marker_col)]
+  pct_for_marker <- pct_positive[pct_positive$marker == marker_col,]
+  
+  cell_counts <- data_for_marker %>%
+    dplyr::group_by(subject, day, tmr) %>%
+    dplyr::mutate(n_cells = n()) %>%
+    dplyr::arrange(subject, day, tmr, get(marker_col)) %>%
+    dplyr::mutate(order_in_group = order(get(marker_col)))
+  
+  cell_counts$percent_pos <- pct_for_marker$percent_pos[match(paste0(cell_counts$subject, cell_counts$day, cell_counts$tmr), paste0(pct_for_marker$donor, pct_for_marker$day, pct_for_marker$tmr))]
+  
+  cell_counts$pos_for_marker <- cell_counts$order_in_group > round(cell_counts$n_cells*(1-cell_counts$percent_pos/100))
+  
+  cell_counts <- cell_counts[order(cell_counts$original_cell),]
+  
+  df_data[,paste0("is_pos_", marker_col)] <- cell_counts$pos_for_marker
+} 
+
+return(df_data)
+}
+
+#tmr_arcsinh_trans_df <- add_pct_positive_data(tmr_arcsinh_trans_df)
+#pre_arcsinh_trans_df <- add_pct_positive_data(pre_arcsinh_trans_df)
+
+#Apply function to lists
+tmr_arcsinh_trans_out <- lapply(tmr_arcsinh_trans, add_pct_positive_data)
+pre_arcsinh_trans_out <- lapply(pre_arcsinh_trans, add_pct_positive_data)
+
+is_positive_marker_vars <- paste0("is_pos_", selected_markers)
+
+```
+
+```{r back_calculate_gates_for_cxcr5}
+#In addition to applying gates to tmr+ and pre-enrichment cells (done above)
+#Get out approximate gate values that can be applied to the cxcr5+ subset
+back_calculate_gates <- function(df_data){
+df_data$original_cell <- seq(1,nrow(df_data))
+
+for(marker_col in selected_markers){
+  data_for_marker <- df_data[,c("subject", "day", "tmr", "original_cell",marker_col)]
+  pct_for_marker <- pct_positive[pct_positive$marker == marker_col,]
+  
+  cell_counts <- data_for_marker %>%
+    dplyr::group_by(subject, day, tmr) %>%
+    dplyr::mutate(n_cells = n()) %>%
+    dplyr::arrange(subject, day, tmr, get(marker_col)) %>%
+    dplyr::mutate(order_in_group = order(get(marker_col)))
+  
+  cell_counts$percent_pos <- pct_for_marker$percent_pos[match(paste0(cell_counts$subject, cell_counts$day, cell_counts$tmr), paste0(pct_for_marker$donor, pct_for_marker$day, pct_for_marker$tmr))]
+    
+  cell_counts$pos_for_marker <- cell_counts$order_in_group > round(cell_counts$n_cells*(1-cell_counts$percent_pos/100))
+  
+  #Get lowest index of a positive cell
+  gate_location_max <- min(cell_counts$order_in_group[cell_counts$pos_for_marker == "TRUE"])
+
+  #Get the highest index of a negative cell
+  gate_location_min <- max(cell_counts$order_in_group[cell_counts$pos_for_marker == "FALSE"])
+  
+  if(is.finite(gate_location_max) & is.finite(gate_location_min)){
+    
+    gate <- 0.5*(cell_counts[cell_counts$order_in_group == gate_location_min, marker_col] + cell_counts[cell_counts$order_in_group == gate_location_max,marker_col])
+    
+  } else if (!is.finite(gate_location_max)){
+    
+    #All cells are negative
+    gate <- cell_counts[gate_location_min, marker_col] #Place gate at highest possible value
+    
+  } else if (!is.finite(gate_location_min)) {
+    
+    #All cells are positive
+    gate <- cell_counts[gate_location_max, marker_col] #Place gate at lowest possible value
+  }
+
+  df_data[,paste0("gate_", marker_col)] <- gate
+} 
+
+gate_vars <- paste0("gate_", selected_markers)
+df_gates <- unique(df_data[,c("subject", "day", "tmr", gate_vars)])
+
+return(df_gates)
+
+}
+
+tmr_gates <- lapply(tmr_arcsinh_trans, back_calculate_gates)
+tmr_gates <- suppressMessages(tmr_gates %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+```
+
+```{r apply_gates_to_cxcr5}
+#Apply the above calculated gates to the CXCR5 subset
+add_cxcr5_pct_positive <- function(df_data, df_gates){
+
+for(marker_col in selected_markers){
+  
+  data_for_marker <- df_data[,c("subject", "day", "tmr", marker_col)]
+  
+  match_idx <- match(unique(paste0(data_for_marker$subject, data_for_marker$day, data_for_marker$tmr)), paste0(df_gates$subject, df_gates$day, df_gates$tmr))
+  
+  gate_value <- df_gates[match_idx, paste0("gate_",marker_col)]
+  
+  data_for_marker$pos_for_marker <- data_for_marker[,marker_col] >= gate_value
+  
+  df_data[,paste0("is_pos_", marker_col)] <- data_for_marker$pos_for_marker
+} 
+
+return(df_data)
+}
+
+cxcr5_arcsinh_trans <- lapply(cxcr5_arcsinh_trans, add_cxcr5_pct_positive, df_gates = tmr_gates)
+
+#Check for consistency on tmr+ data
+#tmr_arcsinh_trans_check <- lapply(tmr_arcsinh_trans, add_cxcr5_pct_positive, df_gates = tmr_gates)
+#tmr_arcsinh_trans_check_df <- tmr_arcsinh_trans_check[[10]]
+#tmr_arcsinh_trans_check2_df <- tmr_arcsinh_trans[[10]]
+#It looks like the % pos match
+```
+
+```{r spot_check_pct_pos_assignments}
+# pre_arcsinh_trans_check <- pre_arcsinh_trans_out[[10]]
+# tmr_arcsinh_trans_check <- tmr_arcsinh_trans_out[[10]]
+# test <- add_pct_positive_data(tmr_arcsinh_trans[[10]])
+# pct_pos_stats <-
+# 
+# subject_ <- unique(tmr_arcsinh_trans_check[,c("subject")])
+# day_ <- unique(tmr_arcsinh_trans_check[,c("day")])
+# tmr_ <- unique(tmr_arcsinh_trans_check[,c("tmr")])
+# 
+# pct_positive_subset <- pct_positive %>%
+#   dplyr::filter(donor == subject_ &
+#                   day == day_ &
+#                   tmr == tmr_)
+# 
+# ggplot(test, aes(x=is_pos_CD45RA, y = CD45RA))+
+#   geom_violin()+
+#   geom_quasirandom()
+# 
+# 
+# ggplot(tmr_arcsinh_trans_check, aes(x=is_pos_CD45RA, y = CD45RA))+
+#   geom_violin()+
+#   geom_quasirandom()
+```
+
+```{r z_score_normalization}
+#Compute marker means and standard deviations for each marker of each pre-enrichment file
+pre_marker_means <- lapply(pre_arcsinh_trans, function(x) apply(x[,selected_markers],2,mean))
+pre_marker_stdev <- lapply(pre_arcsinh_trans, function(x) apply(x[,selected_markers],2,sd))
+
+#Get z-scores for tmr events
+#Match list indices of pre events and tmr+ events from the same subject and day
+summary_idx <- match(paste0(anno_tmr$subject, anno_tmr$day), paste0(anno_pre$subject, anno_pre$day))
+
+#Different matching should be used with cxcr5 data
+summary_idx_cxcr5 <- match(paste0(anno_cxcr5$subject, anno_cxcr5$day), paste0(anno_pre$subject, anno_pre$day))
+
+#initialize empty list for storing z-scores of tmr+ events in the loop below
+tmr_z_scores <- vector("list", length(tmr_arcsinh_trans))
+cxcr5_z_scores <- vector("list", length(cxcr5_arcsinh_trans))
+
+#Calculate z-scores of tmr+ events in a loop
+for(i in 1:length(tmr_arcsinh_trans)){
+  means_i <- pre_marker_means[[summary_idx[i]]]
+  stdev_i <- pre_marker_stdev[[summary_idx[i]]]
+  z_scores_i <- mapply(function(x,y,z) (x-y)/z, tmr_arcsinh_trans[[i]][selected_markers], means_i, stdev_i)
+  #print (i) #For debugging
+  
+  #Force to be a data frame if 1-D
+  if(is.null(dim(z_scores_i))) {
+    z_scores_i <- as.data.frame(t(z_scores_i), col.nanmes = marker_colnames)
+  } else{
+    z_scores_i <- as.data.frame(z_scores_i, col.names = marker_colnames)
+  }
+  
+  #Add subject, day, tmr, positive into
+  z_scores_i <- cbind(z_scores_i, tmr_arcsinh_trans[[i]][c("subject", "day", "tmr", "tmr_group",
+                                                           is_positive_marker_vars)])
+  
+  tmr_z_scores[[i]] <- z_scores_i
+}
+
+#Calculate z-scores of cxcr5+ events in a loop
+for(i in 1:length(cxcr5_arcsinh_trans)){
+  means_i <- pre_marker_means[[summary_idx_cxcr5[i]]]
+  stdev_i <- pre_marker_stdev[[summary_idx_cxcr5[i]]]
+  z_scores_i <- mapply(function(x,y,z) (x-y)/z, cxcr5_arcsinh_trans[[i]][selected_markers], means_i, stdev_i)
+  #print (i) #For debugging
+  
+  #Force to be a data frame if 1-D
+  if(is.null(dim(z_scores_i))) {
+    z_scores_i <- as.data.frame(t(z_scores_i), col.nanmes = marker_colnames)
+  } else{
+    z_scores_i <- as.data.frame(z_scores_i, col.names = marker_colnames)
+  }
+  
+  #Add subject, day, tmr, positive into
+  z_scores_i <- cbind(z_scores_i, cxcr5_arcsinh_trans[[i]][c("subject", "day", "tmr", "tmr_group",
+                                                           is_positive_marker_vars)])
+ 
+  cxcr5_z_scores[[i]] <- z_scores_i
+}
+
+
+#pre_arcsinh_trans_df <- suppressMessages(pre_arcsinh_trans %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+
+#
+
+tmr_arcsinh_trans_df <- suppressMessages(tmr_arcsinh_trans %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+tmr_z_scores_df <- suppressMessages(tmr_z_scores %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+
+cxcr5_arcsinh_trans_df <- suppressMessages(cxcr5_arcsinh_trans %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+cxcr5_z_scores_df <- suppressMessages(cxcr5_z_scores %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+
+```
+
+```{r remove RV}
+#RV specific cells are more rare than the other specificities
+#and often the RV cell number in an individual is low, which makes the Kwok
+#lab concerned that these cells shouldn't be compared to other viral specificities
+tmr_arcsinh_trans_df <- tmr_arcsinh_trans_df[tmr_arcsinh_trans_df$tmr != "rv",]
+tmr_z_scores_df <- tmr_z_scores_df[tmr_z_scores_df$tmr != "rv",]
+
+```
+
+
+```{r get_pre_z_scores}
+#set the number of pre-enrichment cells to sample (there were ~9000-40,000 events/pre sample)
+set.seed(314)
+
+n_pre_events <- 1000
+
+#Make a dataframe for the umap function call
+#pre_arcsinh_trans_ds_df <- suppressMessages(pre_arcsinh_trans_ds %>% Reduce(function(x,y) dplyr::full_join(x,y), .)) 
+
+pre_arcsinh_trans_ds <- lapply(pre_arcsinh_trans, function(x) dplyr::sample_n(x, n_pre_events))
+
+#initialize empty list for storing z-scores of tmr+ events in the loop below
+pre_z_scores <- vector("list", length(pre_arcsinh_trans_ds))
+
+#initialize empty list for storing arcsinh trans values of tmr+ events in the loop below
+#This is redundant, but is an easy way to make sure the result is in the same order as the z-scores results
+pre_arcsinh_trans_results <- vector("list", length(pre_arcsinh_trans_ds))
+
+#Get colnames which are markers 
+#common columns have been kept from each fcs file,
+#so the columns of the first list item can be used
+pre_z_colnames <- colnames(pre_arcsinh_trans_ds[[1]]) 
+
+#Calculate z-scores for each pre-file downsampled event in a loop
+#Only run over selected markers
+for(i in 1:length(pre_arcsinh_trans_ds)){
+  mean_i <- pre_marker_means[[i]][selected_markers]
+  stdev_i <- pre_marker_stdev[[i]][selected_markers]
+  pre_z_scores_i <- mapply(function(x,y,z) (x-y)/z, pre_arcsinh_trans_ds[[i]][,selected_markers], mean_i, stdev_i)
+  #print (i) #For debugging
+  
+  pre_arcsinh_trans_results_i <- pre_arcsinh_trans_ds[[i]]
+  
+  #Force to be a data frame if 1-D
+  if(is.null(dim(pre_z_scores_i))) {
+    pre_z_scores_i <- as.data.frame(t(pre_z_scores_i), col.names = pre_z_colnames)
+    pre_arcsinh_trans_results_i <- as.data.frame(t(pre_arcsinh_trans_results_i), col.names = pre_z_colnames)
+    
+  } else{
+    pre_z_scores_i <- as.data.frame(pre_z_scores_i, col.names = pre_z_colnames)
+    pre_arcsinh_trans_results_i <- as.data.frame(pre_arcsinh_trans_results_i, col.names = pre_z_colnames)
+  }
+  
+  #Add subject, day, tmr, positive into
+  pre_z_scores_i <- cbind(pre_z_scores_i, pre_arcsinh_trans_ds[[i]][c("subject", "day", "tmr", "tmr_group",
+                                                           is_positive_marker_vars)])
+  
+  pre_arcsinh_trans_results_i <- cbind(pre_arcsinh_trans_results_i, pre_arcsinh_trans_ds[[i]][c("subject", "day", "tmr", "tmr_group",is_positive_marker_vars)])
+  
+  pre_z_scores[[i]] <- pre_z_scores_i
+  pre_arcsinh_trans_results[[i]] <- pre_arcsinh_trans_results_i
+  
+}
+
+#Make a dataframe  
+pre_z_scores_df <-do.call(rbind.data.frame, pre_z_scores)
+pre_arcsinh_trans_df <- do.call(rbind.data.frame, pre_arcsinh_trans_results)
+
+#Combine pre and tmr dfs 
+all_z_scores_df <- rbind(pre_z_scores_df[,c(selected_markers, is_positive_marker_vars,"day", "tmr", "subject", "tmr_group")], 
+                         tmr_z_scores_df[,c(selected_markers, is_positive_marker_vars,"day", "tmr", "subject", "tmr_group")]) 
+
+all_arcsinh_trans_df <- rbind(pre_arcsinh_trans_df[,c(selected_markers, is_positive_marker_vars,"day", "tmr", "subject", "tmr_group")], 
+                         tmr_arcsinh_trans_df[,c(selected_markers, is_positive_marker_vars,"day", "tmr", "subject", "tmr_group")]) 
+
+```
+
+
+```{r identify_remove_extreme_outliers}
+#Remove any extreme outliers - boundary events that weren't gated out
+
+get_outiler_indices <- function(z_scores_df, z_limit = 10){
+  
+  #Get indices of events with abs(z-scores) greater than z_limit
+  outliers <- which(abs(z_scores_df[,(colnames(z_scores_df) %in% selected_markers)]) > z_limit, arr.ind = T)
+  # remove outlier events
+  #z_scores_df <- z_scores_df[-outliers[,1],] 
+  
+  return(outliers)
+
+}
+
+outliers_tmr <- get_outiler_indices(tmr_z_scores_df)
+outliers_pre <- get_outiler_indices(pre_z_scores_df)
+outliers_all <- get_outiler_indices(all_z_scores_df)
+
+all_arcsinh_trans_df <- all_arcsinh_trans_df[-outliers_all[,1],] 
+tmr_arcsinh_trans_df <- tmr_arcsinh_trans_df[-outliers_tmr[,1],] 
+
+remove_z_outliers <- function(z_scores_df, z_limit = 10){
+  
+  #Get indices of events with abs(z-scores) greater than z_limit
+  outliers <- which(abs(z_scores_df[,(colnames(z_scores_df) %in% selected_markers)]) > z_limit, arr.ind = T)
+  # remove outlier events
+  z_scores_df <- z_scores_df[-outliers[,1],] 
+  
+  return(z_scores_df)
+
+}
+
+
+tmr_z_scores_df <- remove_z_outliers(tmr_z_scores_df)
+pre_z_scores_df <- remove_z_outliers(pre_z_scores_df)
+all_z_scores_df <- remove_z_outliers(all_z_scores_df)
+
+cxcr5_z_scores_df <- remove_z_outliers(cxcr5_z_scores_df)
+
+
+
+```
+
+```{r order_day_factor_levels}
+#Force day to be a factor
+make_day_factor <- function(df_input){
+  
+  df_input$day <- factor(df_input$day, levels = c("D0", "D7", "D14", "D28", "D60", "D90", "1YR"))
+  return(df_input)
+  
+}
+
+tmr_z_scores_df <- make_day_factor(tmr_z_scores_df)
+pre_z_scores_df <- make_day_factor(pre_z_scores_df)
+all_z_scores_df <- make_day_factor(all_z_scores_df)
+
+cxcr5_z_scores_df <- make_day_factor(cxcr5_z_scores_df)
+
+```
+
+```{r rum_umap_all_cells}
+#Run UMAP on the data
+
+#set a random seed for reproducibility
+set.seed(42)
+
+#Run UMAP over pre and post cells
+all_z_umap <- umap(all_z_scores_df[, selected_markers], method = "naive")
+
+#Add UMAP dimensions to the z scores
+all_z_scores_df$umap_1 <- all_z_umap$layout[,1]
+all_z_scores_df$umap_2 <- all_z_umap$layout[,2]
+
+#Also add UMAP dimensions to the arcsinh transformed data
+all_arcsinh_trans_df$umap_1 <- all_z_umap$layout[,1]
+all_arcsinh_trans_df$umap_2 <- all_z_umap$layout[,2]
+```
+
+```{r plot_umap_all_z}
+#To look for batch effects plot the pre-events umap data and color by subject, visit, treatment
+
+g_umap_all_subject <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=subject),size=0.5)+
+  scale_color_manual(values = subject_cols)+
+  labs(x="UMAP 1", y = "UMAP 2")
+
+g_umap_all_day <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.5)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2")
+
+g_umap_all_tmr_group <- ggplot()+
+  geom_point(data = all_z_scores_df[sample(nrow(all_z_scores_df)),], aes(x = umap_1, y = umap_2, color=tmr_group),size=0.25)+
+  scale_color_manual(values = tmr_group_cols, 
+                     breaks = c("pre", "ebv", "flu","tt","yfv"),
+                     labels = c("Total CD4", "EBV", "Flu", "TT", "YFV"))+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+png(file.path(plot_dir, "umap_tmr_group_all_z.png"), height = 400, width = 500)
+print(g_umap_all_tmr_group)
+dev.off()
+
+g_umap_all_tmr_group_with_alpha <- ggplot()+
+  geom_point(data = all_z_scores_df[sample(nrow(all_z_scores_df)),], aes(x = umap_1, y = umap_2, color=tmr_group, alpha = tmr_group),size=0.25)+
+  scale_alpha_manual(values = c(0.25,0.25,0.1,0.25,0.25), guide=F)+
+  scale_color_manual(values = tmr_group_cols, 
+                     breaks = c("pre", "ebv", "flu","tt","yfv"),
+                     labels = c("Total CD4", "EBV", "Flu", "TT", "YFV"))+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  theme(aspect.ratio=1)+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+png(file.path(plot_dir, "umap_tmr_group_all_z_more_transparent.png"), height = 400, width = 500)
+print(g_umap_all_tmr_group_with_alpha)
+dev.off()
+
+pdf(file.path(plot_dir, "Figure4C.pdf"), height = 4, width = 5.5, useDingbats=F)
+print(g_umap_all_tmr_group_with_alpha)
+dev.off()
+
+
+g_umap_all_subject_day <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.15)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="visit")+
+  facet_wrap(~subject)
+
+
+#Make a plot highlighing how the different epitopes overlap
+
+g_umap_all_tmr_group_facets <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=tmr_group),size=0.25)+
+  scale_color_manual(values = tmr_group_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))+
+  facet_wrap(~tmr_group)
+
+facet_names <- list(
+  'ebv'="EBV",
+  'flu'="Flu",
+  'tt'="TT",
+  'yfv'="YFV",
+  'pre' = "Total CD4"
+)
+
+facet_labeller <- function(variable,value){
+  return(facet_names[value])
+}
+
+#Make a dataframe for plotting with facets of the tmr+ cells only
+g_tmr_pos_facets <- ggplot()+
+  geom_point(data = all_z_scores_df[all_z_scores_df$tmr_group != "pre",], aes(x = umap_1, y = umap_2, color=tmr_group),size=0.25)+
+  scale_color_manual(values = tmr_group_cols, guide=F)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))+
+  facet_wrap(~tmr_group, labeller=facet_labeller)
+
+png(file.path(plot_dir, "umap_tmr_group_all_z_facets.png"), height = 400, width = 500)
+print(g_tmr_pos_facets)
+dev.off()
+
+```
+
+```{r plot_umap_by_marker_all_zscore_pngs}
+
+plot_marker_intensity <- function (umap_info, marker_id, point_size = 0.25){
+  #Set limits to -4 and 4 for coloring, for use with z-scores
+  #umap_info[,marker_id][umap_info[,marker_id] < -4] <- -4
+  #umap_info[,marker_id][umap_info[,marker_id] > 4] <- 4
+ 
+    
+    umap_info[,marker_id][umap_info[,marker_id] < 0] <- -0
+    
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))
+
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_all_z.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+
+  return()
+}
+
+#Run on z_scores
+invisible(lapply(selected_markers, function(x) plot_marker_intensity(all_z_scores_df, x))) 
+
+```
+
+```{r plot_umap_by_marker_all_arcsinh,pdfs}
+
+plot_marker_intensity_arcsinh <- function (umap_info, marker_id, point_size = 0.25, outfile="png"){
+ 
+    #Force the few cells with arcsinh trans of less than 0 to be zero 
+
+    umap_info[,marker_id][umap_info[,marker_id] < 0] <- 0
+    umap_info[,marker_id][umap_info[,marker_id] > 7] <- 7
+
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))+
+    theme(aspect.ratio=1)
+  
+  if(outfile == "png"){
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_all_arcsinh.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  }
+  
+  if(outfile == "pdf"){
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_all_arcsinh.pdf"))
+  pdf(filename, height=4, width=5.5, useDingbats = F)
+  print(g)
+  invisible(dev.off())
+  }
+  
+  return(g)
+}
+
+# invisible(lapply(selected_markers, function(x) plot_marker_intensity_arcsinh(all_arcsinh_trans_df, x, outfile="pdf"))) 
+
+#Melt and use facets? 
+all_archsinh_melted <- melt(all_arcsinh_trans_df, 
+                            id.vars = c("subject", "day", "tmr", "umap_1", "umap_2"),
+                            measure.vars = selected_markers, 
+                            variable.name = "marker") 
+
+all_archsinh_melted$value[all_archsinh_melted$value < 0] <- 0
+all_archsinh_melted$value[all_archsinh_melted$value > 7] <- 7
+
+  g <- ggplot(data = all_archsinh_melted, aes(x=umap_1, y = umap_2, color = value))+
+    geom_point(size=0.25)+
+    labs(x="UMAP 1", y = "UMAP 2", color = "Marker intensity,\narcsinh transformed")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=12),
+          aspect.ratio=1,
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+          strip.background = element_rect(fill="white", colour="black"))+
+      facet_wrap(~marker, ncol=4)
+  
+  filename <- file.path(plot_dir, paste0("FigureS2.png"))
+  png(filename, height=1000, width=800)
+  print(g)
+  invisible(dev.off())
+  
+  filename <- file.path(plot_dir, paste0("FigureS2.tiff"))
+  tiff(filename, height=1000, width=800, compression = "lzw")
+  print(g)
+  invisible(dev.off())
+  
+  # filename <- file.path(plot_dir, paste0("umap_facet_wrap_all_arcsinh.pdf"))
+  # pdf(filename, height=10, width=8, useDingbats = F)
+  # print(g)
+  # invisible(dev.off())
+
+```
+
+```{r umap_all_plot_color_yfv_d90_1yr_}
+#highlight the day 90 and day 360 YFV specific cells in different color codes in the umap plot
+
+all_z_scores_df$yfv_d90_1yr <- ifelse(all_z_scores_df$tmr_group == "yfv" & all_z_scores_df$day=="D90", "yfv_90", ifelse(all_z_scores_df$tmr_group == "yfv" & all_z_scores_df$day == "1YR", "yfv_1yr", "other"))
+
+all_z_scores_df$yfv_late <- ifelse(all_z_scores_df$tmr_group == "yfv" & (all_z_scores_df$day=="D90" | all_z_scores_df$day == "1YR"), "yfv_late", "other")
+
+g_highlight_yfv_d90_1yr <- ggplot()+
+  geom_point(data = all_z_scores_df[order(all_z_scores_df$yfv_late),], aes(x = umap_1, y = umap_2, color=yfv_d90_1yr, alpha=yfv_late),size=0.15)+
+  scale_alpha_manual(values = c(0.1, 1), guide=F)+
+  scale_color_manual(values = c("black", "red", "darkorange"), labels = c("Total CD4", "YFV, 1YR", "YFV, D90"))+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+  
+png(file.path(plot_dir, paste0("umap_d90_1yr_yfv_highlighted_over_all_z.png")), height=400, width=550)
+  print(g_highlight_yfv_d90_1yr)
+  invisible(dev.off())
+```
+
+```{r umap_all_plot_color_yfv_by_day}
+
+g_highlight_yfv_day_over_all <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2), alpha=0.1, color="black", size=0.15)+
+  geom_point(data= all_z_scores_df[all_z_scores_df$tmr_group == "yfv",], aes(x = umap_1, y = umap_2, color=day), alpha=1, size=0.15)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+  
+png(file.path(plot_dir, paste0("umap_yfv_colored_by_day_over_all_z.png")), height=400, width=550)
+  print(g_highlight_yfv_day_over_all)
+  invisible(dev.off())
+  
+png(file.path(plot_dir, paste0("umap_yfv_colored_by_day_over_all_z.png")), height=400, width=550)
+  print(g_highlight_yfv_day_over_all)
+  invisible(dev.off())
+  
+g_highlight_yfv_day_over_all_cols2 <- ggplot()+
+  geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2), alpha=0.1, color="black", size=0.15)+
+  geom_point(data= all_z_scores_df[all_z_scores_df$tmr_group == "yfv",], aes(x = umap_1, y = umap_2, color=day), alpha=0.65, size=0.15)+
+  scale_color_manual(values = rainbow_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(aspect.ratio=1)+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=5)))
+
+png(file.path(plot_dir, paste0("umap_yfv_colored_by_day_over_all_z_rainbow_colors.png")), height=400, width=550)
+  print(g_highlight_yfv_day_over_all_cols2)
+  invisible(dev.off())
+  
+pdf(file.path(plot_dir, "FigureS3.pdf"), height=4, width=5.5, useDingbats = F)
+print(g_highlight_yfv_day_over_all_cols2)
+invisible(dev.off())  
+  
+```
+
+```{r run_umap_yfv_only}
+#set a random seed for reproducibility
+set.seed(123)
+
+#Subset to YFV TMR+ cells
+yfv_z_scores_df <- tmr_z_scores_df[tmr_z_scores_df$tmr_group == "yfv",]
+
+#Run UMAP 
+yfv_z_umap <- umap(yfv_z_scores_df[, selected_markers], method = "naive")
+
+#Add UMAP dimensions to the z scores
+yfv_z_scores_df$umap_1 <- yfv_z_umap$layout[,1]
+yfv_z_scores_df$umap_2 <- yfv_z_umap$layout[,2]
+
+#Also add UMAP to arcsinh transformed yfv only data
+yfv_arcsinh_trans_df <- tmr_arcsinh_trans_df[tmr_arcsinh_trans_df$tmr_group == "yfv",]
+yfv_arcsinh_trans_df$umap_1 <- yfv_z_umap$layout[,1]
+yfv_arcsinh_trans_df$umap_2 <- yfv_z_umap$layout[,2]
+```
+
+```{r plot_umap_yfv_z}
+#To look for batch effects plot the pre-events umap data and color by subject, visit, treatment
+
+g_umap_yfv_subject <- ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=subject),size=0.5)+
+  scale_color_manual(values = subject_cols, guide=F)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_yfv_day <- ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.5)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_yfv_tmr <- ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=tmr),size=0.5)+
+  scale_color_manual(values = tmr_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_yfv_subject_day <- ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.15)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="visit")+
+  facet_wrap(~subject)
+
+png(file.path(plot_dir, "umap_tmr_group_yfv_z.png"), height = 400, width = 500)
+print(g_umap_yfv_tmr)
+dev.off()
+
+png(file.path(plot_dir, "umap_day_yfv_z.png"), height = 400, width = 500)
+print(g_umap_yfv_day)
+dev.off()
+
+png(file.path(plot_dir, "umap_tmr_yfv_z.png"), height = 400, width = 500)
+print(g_umap_yfv_tmr)
+dev.off()
+
+#Color by day using rainbow colors
+
+
+pdf(file.path(plot_dir, "FigureS4A.pdf"), height=4, width=5.5, useDingbats = F)
+
+ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.5)+
+  scale_color_manual(values = rainbow_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="Day")+
+  theme(text = element_text(size=16))+
+  theme(aspect.ratio=1)+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+    
+invisible(dev.off())
+
+#Color by epitope
+pdf(file.path(plot_dir, "Figure5C.pdf"), height=4, width=5.5, useDingbats = F)
+
+ggplot()+
+  geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=tmr),size=0.5, alpha=0.5)+
+  scale_color_manual(values = c("envp8" = "#E7298A",
+                                "ns1" = "#66A61E",
+                                "ns3" = "#E6AB02"),
+                    labels = c("envp8" = "env",
+                                "ns1" = "NS1",
+                                "ns3" = "NS3"))+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  theme(aspect.ratio=1)+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+    
+invisible(dev.off())
+
+```
+
+```{r plot_umap_by_marker_yfv}
+
+plot_marker_intensity <- function (umap_info, marker_id, point_size = 0.25){
+  #Set limits to -4 and 4 for coloring
+  #umap_info[,marker_id][umap_info[,marker_id] < -4] <- -4
+  #umap_info[,marker_id][umap_info[,marker_id] > 4] <- 4
+  
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))
+  
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_yfv_z.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+  return()
+}
+
+invisible(lapply(selected_markers, function(x) plot_marker_intensity(yfv_z_scores_df, x))) 
+
+```
+
+```{r plot_umap_by_marker_yfv_arcsinh,pdfs}
+
+plot_marker_intensity_arcsinh <- function (umap_info, marker_id, point_size = 0.25, outfile="png"){
+ 
+    #Force the few cells with arcsinh trans of less than 0 to be zero 
+
+    umap_info[,marker_id][umap_info[,marker_id] < 0] <- 0
+    umap_info[,marker_id][umap_info[,marker_id] > 6] <- 6
+
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))+
+    theme(aspect.ratio=1)
+  
+  if(outfile == "png"){
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_yfv_arcsinh.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  }
+  
+  if(outfile == "pdf"){
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_yfv_arcsinh.pdf"))
+  pdf(filename, height=4, width=5.5, useDingbats = F)
+  print(g)
+  invisible(dev.off())
+  }
+  
+  return(g)
+}
+
+#invisible(lapply(selected_markers, function(x) plot_marker_intensity_arcsinh(yfv_arcsinh_trans_df, x, outfile="pdf"))) 
+
+plot_marker_intensity_arcsinh(yfv_arcsinh_trans_df, "CXCR5", outfile="pdf")
+
+#Melt and use facets? 
+yfv_archsinh_melted <- melt(yfv_arcsinh_trans_df, 
+                            id.vars = c("subject", "day", "tmr", "umap_1", "umap_2"),
+                            measure.vars = selected_markers, 
+                            variable.name = "marker") 
+
+yfv_archsinh_melted$value[yfv_archsinh_melted$value < 0] <- 0
+yfv_archsinh_melted$value[yfv_archsinh_melted$value > 7] <- 7
+
+  g <- ggplot(data = yfv_archsinh_melted, aes(x=umap_1, y = umap_2, color = value))+
+    geom_point(size=0.25)+
+    labs(x="UMAP 1", y = "UMAP 2", color = "Marker intensity,\narcsinh transformed")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=12),
+          aspect.ratio=1,
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+          strip.background = element_rect(fill="white", colour="black"))+
+      facet_wrap(~marker, ncol=4)
+  
+  filename <- file.path(plot_dir, paste0("yfv_faceted_markers.png"))
+  png(filename, height=1000, width=800)
+  print(g)
+  invisible(dev.off())
+
+```
+
+```{r phenograph_setup}
+#The default tree algorithm in R phenograph is a bdtree which can be problematic,
+#especially with duplicated events
+#Switch to a kdtree
+
+find_neighbors <- function(data, k){
+  nearest <- RANN::nn2(data, data, k, treetype = "kd", searchtype = "standard")
+  return(nearest[[1]])
+}
+
+Rpheno <- function(data, k=30){
+  if(is.data.frame(data))
+    data <- as.matrix(data)
+  
+  if(!is.matrix(data))
+    stop("Wrong input data, should be a data frame or matrix!")
+  
+  if(k<1){
+    stop("k must be a positive integer!")
+  }else if (k > nrow(data)-2){
+    stop("k must be smaller than the total number of points!")
+  }
+  
+  message("Run Rphenograph starts:","\n", 
+          "  -Input data of ", nrow(data)," rows and ", ncol(data), " columns","\n",
+          "  -k is set to ", k)
+  
+  cat("  Finding nearest neighbors...")
+  t1 <- system.time(neighborMatrix <- find_neighbors(data, k=k+1)[,-1])
+  cat("DONE ~",t1[3],"s\n", " Compute jaccard coefficient between nearest-neighbor sets...")
+  t2 <- system.time(links <- Rphenograph:::jaccard_coeff(neighborMatrix))
+  
+  cat("DONE ~",t2[3],"s\n", " Build undirected graph from the weighted links...")
+  links <- links[links[,1]>0, ]
+  relations <- as.data.frame(links)
+  colnames(relations)<- c("from","to","weight")
+  t3 <- system.time(g <- igraph::graph.data.frame(relations, directed=FALSE))
+  
+  cat("DONE ~",t3[3],"s\n", " Run louvain clustering on the graph ...")
+  t4 <- system.time(community <- igraph::cluster_louvain(g))
+  cat("DONE ~",t4[3],"s\n")
+  
+  message("Run Rphenograph DONE, took a total of ", sum(c(t1[3],t2[3],t3[3],t4[3])), "s.")
+  cat("  Return a community class\n  -Modularity value:", igraph::modularity(community),"\n")
+  cat("  -Number of clusters:", length(unique(igraph::membership(community))))
+  
+  return(community)
+}
+
+
+PhenographClust_kd = function(fcs, clustering_markers) {
+  exprs_mat = as.matrix(fcs[,clustering_markers]) 
+  RPvect = as.numeric(igraph::membership(Rpheno(data = exprs_mat)))
+  return(RPvect)
+}
+
+```
+
+```{r cluster_4_check}
+#check cluster 4
+#high median crth2, but all negative for crth2 with gating
+#something looks wrong with this
+cluster_4 <- all_z_scores_df[all_z_scores_df$cluster_pg == "cluster_4",]
+
+ggplot(all_z_scores_df[all_z_scores_df$subject == "YFV023"&
+                         all_z_scores_df$day == "D14" & all_z_scores_df$tmr=="pre",], aes(x=is_pos_CD45RA, y = CD45RA))+
+  geom_violin()
+```
+
+```{r phenograph_all}
+#Run R Phenograph on the total CD4 T cells + yfv-specific cells so clusters can be plotted on the umap projections
+
+all_z_scores_df$cluster_pg <- PhenographClust_kd(all_z_scores_df, selected_markers)
+all_z_scores_df$cluster_pg <- as.factor(paste0("cluster_", as.factor(all_z_scores_df$cluster_pg)))
+levels(all_z_scores_df$cluster_pg) <- mixedsort(levels(as.factor(all_z_scores_df$cluster_pg)))
+
+```
+
+```{r plot_phenograph_clusters_on_umap_all, fig.width=5.5, fig.height=4}
+
+cb_pal <- colorblind_pal()(8)
+n_clusters <- length(unique(all_z_scores_df$cluster_pg))
+cluster_cols <- colorRampPalette(cb_pal[2:8])(n_clusters)
+names(cluster_cols) <- levels(all_z_scores_df$cluster_pg)
+
+g <- ggplot()+
+    geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5, alpha=0.05)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=16))+
+    theme(aspect.ratio=1)+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+  
+  filename <- file.path(plot_dir, "umap_phenograph_all_zOption2.png")
+  png(filename, height=400, width=500)
+  print(g)
+  invisible(dev.off())
+  
+  print(g)
+
+pdf(file.path(plot_dir, "Figure4A.pdf"), height=4, width=5.5, useDingbats = F)
+print(g)
+invisible(dev.off())
+  
+ #plot by phenograph cluster 
+  ggplot()+
+    geom_point(data = all_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))+
+    facet_wrap(~cluster_pg)
+```
+
+```{r plot_heatmap_color_by_pct_positive_all, fig.width=6, fig.height=4}
+#Get the percent of cells in a cluster that are positive for a marker
+
+pct_positive_by_cluster <- all_z_scores_df %>% 
+  dplyr::select(is_positive_marker_vars, cluster_pg) %>%
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::summarise_all(funs(n_cells_T = sum(.==TRUE, na.rm=T),
+                            n_cells_F = sum(.==FALSE, na.rm=T),
+                            pct_pos = sum(.==TRUE, na.rm=T)/(sum(.==TRUE, na.rm=T)+sum(.==FALSE, na.rm=T))*100)) %>%
+  dplyr::select(c("cluster_pg",paste0(is_positive_marker_vars, "_pct_pos"))) %>%
+  as.data.frame()
+  
+rownames(pct_positive_by_cluster) <- pct_positive_by_cluster$cluster_pg
+pct_positive_by_cluster$cluster_pg <- NULL
+
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "is_pos_")  
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "_pct_pos")  
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(all_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols)) 
+
+png(file.path(plot_dir, "heatmap_phenograph_all_z_pct_pos_colors.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+#Try red to blue colors
+heatmap_cols <- colorRampPalette(c("darkblue", "white", "darkred"))(50)
+
+png(file.path(plot_dir, "heatmap_phenograph_all_blue_and_red_pct_pos.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+pdf(file.path(plot_dir, "heatmap_phenograph_all_blue_and_red_pct_pos.pdf"), height=4.5, width=6, useDingbats = F)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+```
+
+```{r plot_phenograph_clusters_heatmap_all, fig.width=6, fig.height=4}
+#Plot median marker expression across clusters
+
+cluster_mfi_median <- all_z_scores_df %>% 
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::select(selected_markers, cluster_pg) %>%
+  dplyr::summarise_all(funs(median)) %>%
+  as.data.frame()
+
+rownames(cluster_mfi_median) <- cluster_mfi_median$cluster_pg
+cluster_mfi_median$cluster_pg <- NULL
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(all_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols)) 
+
+
+png(file.path(plot_dir, "heatmap_phenograph_all_z.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+
+#Get clustering before setting limits for plotting
+
+hmap <- Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+hmap_dendro <- column_dend(hmap)
+
+#Try rainbow pallete colors
+heatmap_cols <- colorRampPalette(c("purple", "blue", "forestgreen", "gold2", "red"))(50)
+
+#Try Virginia's blue to yellow color scheme
+# heatmap_cols <- circlize::colorRamp2(
+#      seq(-2, 2, length.out = 9), 
+#      brewer.pal(n=9, name="YlGnBu"))
+
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+png(file.path(plot_dir, "heatmap_phenograph_all_rainbow_colors.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        cluster_columns = hmap_dendro,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+#Try red to blue colors
+col_fun1 = colorRamp2(c(-2, 0, 2), c("darkblue", "white", "darkred"))
+
+png(file.path(plot_dir, "heatmap_phenograph_all_blue_and_red.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun1,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+#Range scale the heatmap rows
+range_scale <- function(x){(x-min(x))/(max(x)-min(x))}
+
+range_scaled_matrix <- t(apply(cluster_mfi_median, 2, range_scale))
+
+png(file.path(plot_dir, "heatmap_phenograph_all_z_range_scaled.png"), height=400, width=550)
+Heatmap(range_scaled_matrix,
+        name = "Range normalized intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+```
+
+```{r phenograph_numbers_of_cells}
+#Make a table of the number of cells per phenograph cluster
+
+cluster_counts <- as.data.frame.matrix(table(all_z_scores_df$cluster_pg, all_z_scores_df$tmr_group))
+
+cluster_percentages <- apply(cluster_counts,2,function(x) round(x/sum(x)*100,2))
+  
+write.csv(cluster_counts, file.path(plot_dir,  "NumbersOfCellsPerCluster.csv"))
+write.csv(cluster_percentages, file.path(plot_dir, "PercentagesOfCellsPerCluster.csv"))
+
+```
+
+```{r phenograph_numbers_of_yfv_over_all_cells_by_day}
+#Make a table of the number of cells per YFV phenograph cluster
+#Use all clusters
+
+cluster_counts_yfv_over_all <- all_z_scores_df[all_z_scores_df$tmr_group == "yfv",]
+
+cluster_counts_yfv_over_all <-  as.data.frame.matrix(table( cluster_counts_yfv_over_all$cluster_pg,  cluster_counts_yfv_over_all$day))
+
+cluster_percentages_yfv_over_all <- apply(cluster_counts_yfv_over_all,2,function(x) round(x/sum(x)*100,2))
+  
+write.csv(cluster_counts_yfv_over_all, file.path(plot_dir,  "YFVSpecificCellsOverAll_NumbersOfCellsPerCluster.csv"))
+write.csv(cluster_percentages_yfv_over_all, file.path(plot_dir, "YFVSpecificCellsPverAll_PercentagesOfCellsPerCluster.csv"))
+
+```
+
+```{r phenograph_yfv, results="hide"}
+#Run R Phenograph on the YFV-specific cells
+
+yfv_z_scores_df$cluster_pg <- PhenographClust_kd(yfv_z_scores_df, selected_markers)
+yfv_z_scores_df$cluster_pg <- as.factor(paste0("cluster_", as.factor(yfv_z_scores_df$cluster_pg)))
+levels(yfv_z_scores_df$cluster_pg) <- mixedsort(levels(as.factor(yfv_z_scores_df$cluster_pg)))
+
+```
+
+```{r plot_phenograph_clusters_on_umap_yfv, fig.width=5.5, fig.height=4}
+
+cb_pal <- colorblind_pal()(8)
+n_clusters <- length(unique(yfv_z_scores_df$cluster_pg))
+cluster_cols <- colorRampPalette(cb_pal[2:8])(n_clusters)
+names(cluster_cols) <- levels(yfv_z_scores_df$cluster_pg)
+
+g <- ggplot()+
+    geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+  
+  filename <- file.path(plot_dir, "umap_phenograph_yfv_z.png")
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+
+pdf(file.path(plot_dir, "Figure5A.pdf"), height=4, width=5.5, useDingbats = F)
+
+  ggplot()+
+    geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5, alpha=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    theme(aspect.ratio=1)+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+
+invisible(dev.off())
+  
+  
+  ggplot()+
+    geom_point(data = yfv_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    facet_wrap(~cluster_pg)+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+```
+
+```{r plot_heatmap_color_by_pct_positive_yfv, fig.width=6, fig.height=4}
+#Get the percent of cells in a cluster that are positive for a marker
+
+pct_positive_by_cluster <- yfv_z_scores_df %>% 
+  dplyr::select(is_positive_marker_vars, cluster_pg) %>%
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::summarise_all(funs(n_cells_T = sum(.==TRUE, na.rm=T),
+                            n_cells_F = sum(.==FALSE, na.rm=T),
+                            pct_pos = sum(.==TRUE, na.rm=T)/(sum(.==TRUE, na.rm=T)+sum(.==FALSE, na.rm=T))*100))%>%
+  dplyr::select(c("cluster_pg",paste0(is_positive_marker_vars, "_pct_pos"))) %>%
+  as.data.frame()
+  
+rownames(pct_positive_by_cluster) <- pct_positive_by_cluster$cluster_pg
+pct_positive_by_cluster$cluster_pg <- NULL
+
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "is_pos_")  
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "_pct_pos")  
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(all_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols)) 
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_z_pct_pos_colors.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+#Try red to blue colors
+heatmap_cols <- colorRampPalette(c("darkblue", "white", "darkred"))(50)
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_blue_and_red_pct_pos.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+
+pdf(file.path(plot_dir, "heatmap_phenograph_yfv_blue_and_red_pct_pos.pdf"), height=4.5, width=6, useDingbats = F)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+##Add annotation to show % of cells in cluster that are NS1, NS2, Envp8
+
+#Count % of cells in a cluster that are specific to what epitope
+tmr_pct <- yfv_z_scores_df %>%
+  dplyr::group_by(cluster_pg, tmr) %>%
+  dplyr::summarize(cluster_count = n()) %>%
+  dplyr::group_by(cluster_pg) %>%
+  dplyr::mutate(cluster_pct = round(cluster_count/sum(cluster_count)*100)) %>%
+  dplyr::select(-one_of(c("cluster_count"))) %>%
+  spread(key=tmr, value=cluster_pct) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-one_of(c("cluster_pg"))) %>%
+  as.data.frame() %>%
+  as.matrix()
+
+#rownames(tmr_pct) <- c("Envp8", "Ns1", "Ns3")
+
+envp8_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["envp8"]))
+ns1_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["ns1"]))
+ns3_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["ns3"]))
+
+tmr_anno <- HeatmapAnnotation(Envp8 = tmr_pct[,"envp8"],
+                              Ns1 = tmr_pct[,"ns1"],
+                              Ns3 = tmr_pct[,"ns3"],
+                              col = list(Envp8 = envp8_cols,
+                                         Ns1 = ns1_cols, 
+                                         Ns3 = ns3_cols),
+                              show_annotation_name = T,
+                              annotation_legend_param = list(
+                                Envp8 = list(title = "% Envp8 specific"),
+                                Ns1 = list(title = "% Ns1 specific"),
+                                Ns3 = list(title = "% Ns3 specific")),
+                              gp = gpar(col = "black")) 
+png(file.path(plot_dir, "heatmap_phenograph_yfv_blue_and_red_pct_pos_eptiope_grid.png"), height=450, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno,
+        bottom_annotation = tmr_anno)
+
+invisible(dev.off())
+
+#Write out the % of each tmr per cluster in table form
+tmr_export <- as.data.frame(tmr_pct) 
+tmr_export$cluster_pg <- paste0("cluster ", seq(1,nrow(tmr_pct), by=1)) 
+tmr_export <- tmr_export[, c("cluster_pg","envp8", "ns1", "ns3")]
+write.csv(tmr_export, file.path(plot_dir, "PercentOfTmrPerClusterOfYFVCells.csv"), quote = F, row.names = F) 
+```
+
+```{r plot_phenograph_clusters_heatmap_yfv, fig.width=6, fig.height=4}
+#Plot median marker expression across clusters
+
+cluster_mfi_median <- yfv_z_scores_df %>% 
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::select(selected_markers, cluster_pg) %>%
+  dplyr::summarise_all(funs(median))
+
+rownames(cluster_mfi_median) <- cluster_mfi_median$cluster_pg
+cluster_mfi_median$cluster_pg <- NULL
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(yfv_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols))  
+
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_z.png"), height=400, width=600)
+Heatmap(t(cluster_mfi_median[,2:ncol(cluster_mfi_median)]),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_rainbow_colors.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+#Try red to blue colors
+col_fun1 = colorRamp2(c(-2, 0, 2), c("darkblue", "white", "darkred"))
+
+col_fun2 = colorRamp2(c(-2, 0, 4), c("darkblue", "white", "darkred"))
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_blue_and_red.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun1,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+png(file.path(plot_dir, "heatmap_phenograph_yfv_blue_and_red_scale2.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun2,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+```
+
+
+```{r investigate_phenograph_clusters}
+#Make plots over all clusters 
+
+for(selected_cluster in levels(yfv_z_scores_df$cluster_pg)){
+  
+cluster_cell_counts <- yfv_z_scores_df %>% 
+  dplyr::filter(day != "D0" & day != "D7") %>%
+  dplyr::group_by(subject, day) %>%
+  dplyr::summarise(cluster_count = sum(cluster_pg == selected_cluster),
+                   num_cells = n()) %>%
+  dplyr::mutate(cluster_percent = cluster_count/num_cells*100)
+
+y_title <- paste0("% of YFV-specific cells\nin", selected_cluster)
+fig_filename <-paste0(selected_cluster ,"_vs_day.png") 
+  
+ggplot(cluster_cell_counts, aes(x=day, y=cluster_count, color=subject))+
+  geom_quasirandom()+
+  scale_color_manual(values = subject_cols)+
+  labs(x="", y="number of cluster cells")+
+  theme(text = element_text(size=16))
+
+g_cluster <- ggplot(cluster_cell_counts, aes(x=day, y=cluster_percent, color=subject, group=subject))+
+  #geom_point(size=2.5)+
+  geom_line()+
+  scale_color_manual(values = subject_cols)+
+  stat_summary(aes(x=day, y = cluster_percent, group =1), fun.y = mean, geom="line", size = 2)+
+  labs(x="", y=y_title)+
+  theme(text = element_text(size=18))
+
+
+filename <- file.path(plot_dir, fig_filename)
+  png(filename, height=400, width=600)
+  print(g_cluster)
+  invisible(dev.off())
+  
+}
+
+
+```
+
+```{r epitopes_over_time}
+
+tmr_freq_by_day <- yfv_z_scores_df %>% 
+  dplyr::filter(day != "D0" & day != "D7") %>%
+  dplyr::group_by(subject, day, tmr) %>%
+  dplyr::summarise(tmr_count = n()) %>%
+  dplyr::mutate(tmr_percent = round(tmr_count/sum(tmr_count)*100,0))
+
+tmr_freq_by_day_subject_means <- tmr_freq_by_day %>%
+  dplyr::group_by(day, tmr) %>%
+  dplyr::summarise(tmr_mean = mean(tmr_percent, na.rm = T), tmr_sd = sd(tmr_percent, na.rm = T), tmr_median = median (tmr_percent, na.rm = T))
+
+#Try a plot with many lines
+ggplot(data=tmr_freq_by_day)+
+  geom_line(aes(x=day, y = tmr_percent, group=interaction(subject, tmr), color=tmr))+
+  stat_summary(aes(x=day, y = tmr_percent, group =tmr, color=tmr), fun.y = mean, geom="line", size = 2)+
+  scale_color_manual(values = tmr_cols)+
+  labs(x="", y="% YFV-specific cells", fill="")
+
+#Try a boxplot
+ggplot(data=tmr_freq_by_day)+
+  geom_boxplot(aes(x=day, y = tmr_percent, group= interaction(tmr,day), fill=tmr))+
+  scale_fill_manual(values = tmr_cols)+
+  labs(x="", y="% YFV-specific cells\nwith epitope specificity", fill="")+
+  guides(colour = guide_legend(override.aes = list(size=3.5)))
+
+#Plot means+/-sd
+pd <- position_dodge(0.5) # set how far to offset points in plot below
+
+g_freq_by_tmr <- ggplot(data = tmr_freq_by_day_subject_means, aes(x=day, y=tmr_mean, colour=tmr, group=tmr)) + 
+  geom_errorbar(aes(ymin=tmr_mean-tmr_sd, ymax=tmr_mean+tmr_sd), width=.25, position=pd) +
+  geom_line(position=pd, size=1) +
+  geom_point(position=pd) +
+  scale_color_manual(values = tmr_cols)+
+  labs(x="", y="% YFV-specific cells\nwith epitope specificity", color="")+
+  theme(text = element_text(size=18))+
+  guides(colour = guide_legend(override.aes = list(size=3.5)))
+
+filename <- file.path(plot_dir, "yfv_tmr_freq_by_day.png")
+  png(filename, height=400, width=600)
+  print(g_freq_by_tmr)
+  invisible(dev.off())
+  
+```
+
+```{r phenograph_numbers_of_yfv_cells_by_day}
+#Make a table of the number of cells per YFV phenograph cluster
+
+cluster_counts_yfv <- as.data.frame.matrix(table( yfv_z_scores_df$cluster_pg,  yfv_z_scores_df$day))
+
+cluster_percentages_yfv <- apply(cluster_counts_yfv,2,function(x) round(x/sum(x)*100,2))
+  
+write.csv(cluster_counts_yfv, file.path(plot_dir,  "YFVSpecificCells_NumbersOfCellsPerCluster.csv"))
+write.csv(cluster_percentages_yfv, file.path(plot_dir, "YFVSpecificCellsPercentagesOfCellsPerCluster.csv"))
+
+```
+
+```{r run_umap_cxcr5_pos_cells}
+#Run UMAP on the data
+
+#set a random seed for reproducibility
+set.seed(314)
+
+#Run UMAP over pre and post cells
+cxcr5_z_umap <- umap(cxcr5_z_scores_df[, selected_markers], method = "naive")
+
+#Add UMAP dimensions to the z scores
+cxcr5_z_scores_df$umap_1 <- cxcr5_z_umap$layout[,1]
+cxcr5_z_scores_df$umap_2 <- cxcr5_z_umap$layout[,2]
+
+```
+
+```{r plot_umap_cxcr5}
+
+g_umap_cxcr5_subject <- ggplot()+
+  geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=subject),size=1)+
+  scale_color_manual(values = subject_cols, guide=F)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_day <- ggplot()+
+  geom_point(data =cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=1)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_tmr <- ggplot()+
+  geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=tmr),size=1)+
+  scale_color_manual(values = tmr_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_subject_day <- ggplot()+
+  geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=0.5)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="visit")+
+  facet_wrap(~subject)
+
+png(file.path(plot_dir, "umap_subject_cxcr5_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_subject)
+dev.off()
+
+png(file.path(plot_dir, "umap_day_cxcr5_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_day)
+dev.off()
+
+png(file.path(plot_dir, "umap_tmr_cxcr5_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_tmr)
+dev.off()
+
+
+pdf(file.path(plot_dir, "Figure7C.pdf"), height=4, width=5.5, useDingbats = F)
+
+ggplot()+
+  geom_point(data =cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=1)+
+  scale_color_manual(values = rainbow_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="Day")+
+  theme(text = element_text(size=16))+
+  theme(aspect.ratio=1)+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+    
+invisible(dev.off())
+
+```
+
+```{r plot_umap_by_marker_cxcr5}
+
+plot_marker_intensity <- function (umap_info, marker_id, point_size = 0.5){
+  #Set limits to -4 and 4 for coloring
+  umap_info[,marker_id][umap_info[,marker_id] < -2] <- -2
+  umap_info[,marker_id][umap_info[,marker_id] > 4.5] <- 4.5
+  
+  
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis(limits = c(-2,4.5))+
+    #scale_color_gradient2(low = "darkblue",
+    #                      mid = "white",
+    #                      high = "red")+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))
+  
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_cxcr5_z.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+  return()
+}
+
+invisible(lapply(selected_markers, function(x) plot_marker_intensity(cxcr5_z_scores_df, x))) 
+
+```
+
+```{r phenograph_cxcr5, results="hide"}
+#Run R Phenograph on the YFV-specific cells
+
+cxcr5_z_scores_df$cluster_pg <- PhenographClust_kd(cxcr5_z_scores_df, selected_markers)
+cxcr5_z_scores_df$cluster_pg <- as.factor(paste0("cluster_", as.factor(cxcr5_z_scores_df$cluster_pg)))
+levels(cxcr5_z_scores_df$cluster_pg) <- mixedsort(levels(as.factor(cxcr5_z_scores_df$cluster_pg)))
+
+```
+
+```{r plot_phenograph_clusters_on_umap_cxcr5, fig.width=5.5, fig.height=4}
+
+cb_pal <- colorblind_pal()(8)
+n_clusters <- length(unique(cxcr5_z_scores_df$cluster_pg))
+cluster_cols <- colorRampPalette(cb_pal[2:8])(n_clusters)
+names(cluster_cols) <- levels(cxcr5_z_scores_df$cluster_pg)
+
+g <- ggplot()+
+    geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+  
+  filename <- file.path(plot_dir, "umap_phenograph_cxcr5_z.png")
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+  print(g)
+  
+  ggplot()+
+    geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))+
+    facet_wrap(~cluster_pg)
+  
+pdf(file.path(plot_dir, "Figure7A.pdf"), height=4, width=5.5, useDingbats = F)
+
+ggplot()+
+    geom_point(data = cxcr5_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=0.5)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    theme(aspect.ratio=1)+
+    guides(colour = guide_legend(override.aes = list(size=2)))
+    
+invisible(dev.off())
+  
+
+```
+
+```{r plot_heatmap_color_by_pct_positive_cxcr5, fig.width=6, fig.height=4}
+#Get the percent of cells in a cluster that are positive for a marker
+
+pct_positive_by_cluster <- cxcr5_z_scores_df %>% 
+  dplyr::select(is_positive_marker_vars, cluster_pg) %>%
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::summarise_all(funs(n_cells_T = sum(.==TRUE, na.rm=T),
+                            n_cells_F = sum(.==FALSE, na.rm=T),
+                            pct_pos = sum(.==TRUE, na.rm=T)/(sum(.==TRUE, na.rm=T)+sum(.==FALSE, na.rm=T))*100)) %>%
+  dplyr::select(c("cluster_pg",paste0(is_positive_marker_vars, "_pct_pos"))) %>%
+  as.data.frame()
+  
+rownames(pct_positive_by_cluster) <- pct_positive_by_cluster$cluster_pg
+pct_positive_by_cluster$cluster_pg <- NULL
+
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "is_pos_")  
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "_pct_pos")  
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(cxcr5_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols)) 
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_z_pct_pos_colors.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+#Try red to blue colors
+heatmap_cols <- colorRampPalette(c("darkblue", "white", "darkred"))(50)
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_pct_pos.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+
+pdf(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_pct_pos.pdf"), height=4.5, width=6, useDingbats = F)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+#Count % of cells in a cluster that are specific to what epitope
+tmr_pct_cxcr5 <- cxcr5_z_scores_df %>%
+  dplyr::group_by(cluster_pg, tmr) %>%
+  dplyr::summarize(cluster_count = n()) %>%
+  dplyr::group_by(cluster_pg) %>%
+  dplyr::mutate(cluster_pct = round(cluster_count/sum(cluster_count)*100)) %>%
+  dplyr::select(-one_of(c("cluster_count"))) %>%
+  spread(key=tmr, value=cluster_pct) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-one_of(c("cluster_pg"))) %>%
+  as.data.frame() %>%
+  as.matrix()
+
+day_pct_cxcr5 <- cxcr5_z_scores_df %>%
+  dplyr::group_by(cluster_pg, day) %>%
+  dplyr::summarize(cluster_count = n()) %>%
+  dplyr::group_by(day) %>%
+  dplyr::mutate(cluster_pct = round(cluster_count/sum(cluster_count)*100)) %>%
+  dplyr::select(-one_of(c("cluster_count"))) %>%
+  spread(key=day, value=cluster_pct) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-one_of(c("cluster_pg", "D0", "D7"))) %>%
+  as.data.frame() %>%
+  as.matrix()
+
+day_pct_cxcr5[is.na(day_pct_cxcr5)] <- 0 
+
+envp8_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["envp8"]))
+ns1_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["ns1"]))
+ns3_cols = colorRamp2(c(0, 100), c("#FFFFFF", tmr_cols["ns3"]))
+
+day_max <- 100
+D0_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D0"]))
+D7_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D7"]))
+D14_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D14"]))
+D28_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D28"]))
+D60_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D60"]))
+D90_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["D90"]))
+YR1_cols = colorRamp2(c(0, day_max), c("#FFFFFF", day_cols["1YR"]))
+
+tmr_anno <- HeatmapAnnotation(Envp8 = tmr_pct_cxcr5[,"envp8"],
+                              Ns1 = tmr_pct_cxcr5[,"ns1"],
+                              Ns3 = tmr_pct_cxcr5[,"ns3"],
+                              col = list(Envp8 = envp8_cols,
+                                         Ns1 = ns1_cols, 
+                                         Ns3 = ns3_cols),
+                              show_annotation_name = T,
+                              annotation_legend_param = list(
+                                Envp8 = list(title = "% Envp8 specific"),
+                                Ns1 = list(title = "% Ns1 specific"),
+                                Ns3 = list(title = "% Ns3 specific")),
+                              gp = gpar(col = "black")) 
+
+day_anno <- HeatmapAnnotation(#D0 = day_pct_cxcr5[,"D0"],
+                              #D7 = day_pct_cxcr5[,"D7"],
+                              D14 = day_pct_cxcr5[,"D14"],
+                              D28 = day_pct_cxcr5[,"D28"],
+                              D60 = day_pct_cxcr5[,"D60"],
+                              D90 = day_pct_cxcr5[,"D90"],
+                              YR1 = day_pct_cxcr5[,"1YR"],
+                              col = list(#D0 = D0_cols,
+                                         #D7 = D7_cols, 
+                                         D14 = D14_cols,
+                                         D28 = D28_cols,
+                                         D60 = D60_cols,
+                                         D90 = D90_cols,
+                                         YR1 = YR1_cols),
+                              show_annotation_name = T,
+                              gp = gpar(col = "black")) 
+
+#Try to reorder columns clusters
+#Heatmap() seems to ignore a custom column dendrogram
+# library(dendsort)
+# library(dendextend)
+# 
+# column_dend = as.dendrogram(hclust(dist(mat)))
+# plot(column_dend)
+# 
+# custom_dend <- rotate(column_dend, c(4,8,5,1,2,3,7,6,9,10,11),
+#                       decreasing=T)
+# 
+# plot(custom_dend)
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_pct_pos_day_grid.png"), height=450, width=550)
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        #cluster_columns = custom_dend, 
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno,
+        bottom_annotation = day_anno
+        ) 
+
+invisible(dev.off()) 
+
+pdf(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_pct_pos_day_grid.pdf"), height=10, width=10, useDingbats = F)
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        #cluster_columns = custom_dend, 
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno,
+        bottom_annotation = day_anno
+        ) 
+
+invisible(dev.off()) 
+
+
+#Compute %'s by groups a-d
+cxcr5_z_scores_df$group <- ifelse(cxcr5_z_scores_df$cluster_pg %in% c("cluster_4", "cluster_5", "cluster_8"), "group_a", ifelse(cxcr5_z_scores_df$cluster_pg %in% c("cluster_1", "cluster_2"), "group_b",ifelse(cxcr5_z_scores_df$cluster_pg %in% c("cluster_3", "cluster_6", "cluster_7"), "group_c",ifelse(cxcr5_z_scores_df$cluster_pg %in% c("cluster_9", "cluster_10", "cluster_11"), "group_d","other"))))
+
+
+day_pct_cxcr5_groups <- cxcr5_z_scores_df %>%
+  dplyr::group_by(group, day) %>%
+  dplyr::summarize(cluster_count = n()) %>%
+  dplyr::group_by(day) %>%
+  dplyr::mutate(cluster_pct = round(cluster_count/sum(cluster_count)*100)) %>%
+  dplyr::select(-one_of(c("cluster_count"))) %>%
+  dplyr::filter(!(day %in% c("D0", "D7")))
+
+g <- ggplot(day_pct_cxcr5_groups, aes(x=day, y = cluster_pct, group=group, color=group))+
+  geom_line()+
+  labs(x="Visit", y = "% of cells", color = "")
+
+pdf(file.path(plot_dir, "cluster_groups_by_day_cxcr5.pdf"), height=3.5, width=5.5, useDingbats = F)
+print(g)
+dev.off()
+
+day_pct_cxcr5_groups_tmr <- cxcr5_z_scores_df %>%
+  dplyr::group_by(group, day, tmr) %>%
+  dplyr::summarize(cluster_count = n()) %>%
+  dplyr::group_by(day, tmr) %>%
+  dplyr::mutate(cluster_pct = round(cluster_count/sum(cluster_count)*100)) %>%
+  dplyr::select(-one_of(c("cluster_count"))) %>%
+  dplyr::filter(!(day %in% c("D0", "D7")))
+
+g <- ggplot(day_pct_cxcr5_groups_tmr, aes(x=day, y = cluster_pct, group=group, color=group))+
+  geom_line()+
+  labs(x="Visit", y = "% of cells", color = "")+
+  facet_wrap(~tmr)
+
+pdf(file.path(plot_dir, "cluster_groups_by_day_tmr_cxcr5.pdf"), height=3.5, width=10, useDingbats = F)
+print(g)
+dev.off()
+```
+
+
+
+```{r plot_phenograph_clusters_heatmap_cxcr5, fig.width=6, fig.height=4}
+#Plot median marker expression across clusters
+
+cluster_mfi_median <- cxcr5_z_scores_df %>% 
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::select(selected_markers, cluster_pg) %>%
+  dplyr::summarise_all(funs(median)) %>%
+  as.data.frame()
+
+rownames(cluster_mfi_median) <- cluster_mfi_median$cluster_pg
+cluster_mfi_median$cluster_pg <- NULL
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(cxcr5_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols))  
+
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_z.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+
+#Try red to blue colors
+col_fun1 = colorRamp2(c(-2, 0, 2), c("darkblue", "white", "darkred"))
+
+col_fun2 = colorRamp2(c(-2, 0, 4), c("darkblue", "white", "darkred"))
+
+col_fun3 = colorRamp2(c(-2, 0, 6), c("darkblue", "white", "darkred"))
+
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun1,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_scale_2.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun2,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_blue_and_red_scale_3.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun3,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+```
+
+```{r investigate_phenograph_clusters_cxcr5}
+#Make plots over all clusters 
+
+for(selected_cluster in levels(cxcr5_z_scores_df$cluster_pg)){
+  
+cluster_cell_counts <- cxcr5_z_scores_df %>% 
+  dplyr::filter(day != "D0" & day != "D7") %>%
+  dplyr::group_by(subject, day) %>%
+  dplyr::summarise(cluster_count = sum(cluster_pg == selected_cluster),
+                   num_cells = n()) %>%
+  dplyr::mutate(cluster_percent = cluster_count/num_cells*100)
+
+y_title <- paste0("% of CXCR5+ cells\nin", selected_cluster)
+fig_filename <-paste0(selected_cluster ,"CXCR5_vs_day.png") 
+  
+ggplot(cluster_cell_counts, aes(x=day, y=cluster_count, color=subject))+
+  geom_quasirandom()+
+  scale_color_manual(values = subject_cols)+
+  labs(x="", y="number of cluster cells")+
+  theme(text = element_text(size=16))
+
+g_cluster <- ggplot(cluster_cell_counts, aes(x=day, y=cluster_percent, color=subject, group=subject))+
+  #geom_point(size=2.5)+
+  geom_line()+
+  scale_color_manual(values = subject_cols)+
+  stat_summary(aes(x=day, y = cluster_percent, group =1), fun.y = mean, geom="line", size = 2)+
+  labs(x="", y=y_title)+
+  theme(text = element_text(size=18))
+
+
+filename <- file.path(plot_dir, fig_filename)
+  png(filename, height=400, width=600)
+  print(g_cluster)
+  invisible(dev.off())
+  
+}
+```
+
+
+```{r run_umap_cxcr5_pos_envp8_cells}
+#Run UMAP on the data
+
+#set a random seed for reproducibility
+set.seed(159)
+
+cxcr5_envp8_z_scores_df <- cxcr5_z_scores_df[cxcr5_z_scores_df$tmr == "envp8",]
+
+#Run UMAP over pre and post cells
+cxcr5_envp8_z_umap <- umap(cxcr5_envp8_z_scores_df[, selected_markers], method = "naive")
+
+#Add UMAP dimensions to the z scores
+cxcr5_envp8_z_scores_df$umap_1 <- cxcr5_envp8_z_umap$layout[,1]
+cxcr5_envp8_z_scores_df$umap_2 <- cxcr5_envp8_z_umap$layout[,2]
+
+```
+
+```{r plot_umap_cxcr5_envp8}
+
+g_umap_cxcr5_envp8_subject <- ggplot()+
+  geom_point(data = cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=subject),size=2)+
+  scale_color_manual(values = subject_cols, guide=F)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_envp8_day <- ggplot()+
+  geom_point(data =cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=2)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_envp8_tmr <- ggplot()+
+  geom_point(data = cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=tmr),size=2)+
+  scale_color_manual(values = tmr_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="")+
+  theme(text = element_text(size=16))+
+  guides(colour = guide_legend(override.aes = list(size=2)))
+
+g_umap_cxcr5_subject_day <- ggplot()+
+  geom_point(data = cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=day),size=1)+
+  scale_color_manual(values = day_cols)+
+  labs(x="UMAP 1", y = "UMAP 2", color="visit")+
+  facet_wrap(~subject)
+
+png(file.path(plot_dir, "umap_subject_cxcr5_envp8_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_envp8_subject)
+dev.off()
+
+png(file.path(plot_dir, "umap_day_cxcr5_envp8_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_envp8_day)
+dev.off()
+
+png(file.path(plot_dir, "umap_tmr_cxcr5_envp8_z.png"), height = 400, width = 500)
+print(g_umap_cxcr5_envp8_tmr)
+dev.off()
+
+```
+
+```{r plot_umap_by_marker_cxcr5_envp8}
+
+plot_marker_intensity <- function (umap_info, marker_id, point_size = 1){
+  #Set limits to -4 and 4 for coloring
+  #umap_info[,marker_id][umap_info[,marker_id] < -4] <- -4
+  #umap_info[,marker_id][umap_info[,marker_id] > 4] <- 4
+  
+  g <- ggplot(data = umap_info, aes(x=umap_1, y = umap_2, color = get(marker_id)))+
+    geom_point(size=point_size)+
+    labs(color=marker_id, x="UMAP 1", y = "UMAP 2")+
+    scale_color_viridis()+
+    #scale_color_gradientn(colours = rev(rainbow(6)))+
+    theme(text = element_text(size=16))
+  
+  filename <- file.path(plot_dir, paste0("umap_",marker_id, "_cxcr5_z.png"))
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+  return()
+}
+
+invisible(lapply(selected_markers, function(x) plot_marker_intensity(cxcr5_envp8_z_scores_df, x))) 
+
+```
+
+```{r phenograph_cxcr5_envp8, results="hide"}
+#Run R Phenograph on the YFV-specific cells
+
+cxcr5_envp8_z_scores_df$cluster_pg <- PhenographClust_kd(cxcr5_envp8_z_scores_df, selected_markers)
+cxcr5_envp8_z_scores_df$cluster_pg <- as.factor(paste0("cluster_", as.factor(cxcr5_envp8_z_scores_df$cluster_pg)))
+levels(cxcr5_envp8_z_scores_df$cluster_pg) <- mixedsort(levels(as.factor(cxcr5_envp8_z_scores_df$cluster_pg)))
+
+```
+
+```{r plot_phenograph_clusters_on_umap_cxcr5_envp8, fig.width=5.5, fig.height=4}
+
+cb_pal <- colorblind_pal()(8)
+n_clusters <- length(unique(cxcr5_envp8_z_scores_df$cluster_pg))
+cluster_cols <- colorRampPalette(cb_pal[2:8])(n_clusters)
+names(cluster_cols) <- levels(cxcr5_envp8_z_scores_df$cluster_pg)
+
+g <- ggplot()+
+    geom_point(data = cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=1)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))
+  
+  filename <- file.path(plot_dir, "umap_phenograph_cxcr5_envp8_z.png")
+  png(filename, height=400, width=550)
+  print(g)
+  invisible(dev.off())
+  
+  print(g)
+  
+  ggplot()+
+    geom_point(data = cxcr5_envp8_z_scores_df, aes(x = umap_1, y = umap_2, color=as.factor(cluster_pg)),size=1)+
+    labs(x="UMAP 1", y = "UMAP 2", color="")+
+    scale_color_manual(values = cluster_cols)+
+    theme(text = element_text(size=12))+
+    guides(colour = guide_legend(override.aes = list(size=3.5)))+
+    facet_wrap(~cluster_pg)
+  
+
+```
+
+```{r plot_heatmap_color_by_pct_positive_cxcr5_envp8, fig.width=6, fig.height=4}
+#Get the percent of cells in a cluster that are positive for a marker
+
+pct_positive_by_cluster <- cxcr5_envp8_z_scores_df %>% 
+  dplyr::select(is_positive_marker_vars, cluster_pg) %>%
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::summarise_all(funs(n_cells_T = sum(.==TRUE, na.rm=T),
+                            n_cells_F = sum(.==FALSE, na.rm=T),
+                            pct_pos = sum(.==TRUE, na.rm=T)/(sum(.==TRUE, na.rm=T)+sum(.==FALSE, na.rm=T))*100)) %>%
+  dplyr::select(c("cluster_pg",paste0(is_positive_marker_vars, "_pct_pos"))) %>%
+  as.data.frame()
+  
+rownames(pct_positive_by_cluster) <- pct_positive_by_cluster$cluster_pg
+pct_positive_by_cluster$cluster_pg <- NULL
+
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "is_pos_")  
+names(pct_positive_by_cluster) <- str_remove(names(pct_positive_by_cluster), "_pct_pos")  
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(cxcr5_envp8_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols)) 
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_z_pct_pos_colors.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+#Try red to blue colors
+heatmap_cols <- colorRampPalette(c("darkblue", "white", "darkred"))(50)
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_blue_and_red_pct_pos.png"), height=400, width=550)
+Heatmap(t(pct_positive_by_cluster),
+        name = "% marker + in cluster",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+```
+
+```{r plot_phenograph_clusters_heatmap_cxcr5_envp8, fig.width=6, fig.height=4}
+#Plot median marker expression across clusters
+
+cluster_mfi_median <- cxcr5_envp8_z_scores_df %>% 
+  dplyr::group_by(cluster_pg) %>% 
+  dplyr::select(selected_markers, cluster_pg) %>%
+  dplyr::summarise_all(funs(median)) %>%
+  as.data.frame()
+
+rownames(cluster_mfi_median) <- cluster_mfi_median$cluster_pg
+cluster_mfi_median$cluster_pg <- NULL
+
+heatmap_cols <- plasma(50)
+
+col_anno <- HeatmapAnnotation(cluster=levels(cxcr5_envp8_z_scores_df$cluster_pg),
+                              col = list(cluster = cluster_cols))  
+
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_z.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = heatmap_cols,
+        row_names_gp = gpar(fontsize = 10),
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+
+#Try red to blue colors
+col_fun1 = colorRamp2(c(-2, 0, 2), c("darkblue", "white", "darkred"))
+
+col_fun2 = colorRamp2(c(-2, 0, 4), c("darkblue", "white", "darkred"))
+
+col_fun3 = colorRamp2(c(-2, 0, 6), c("darkblue", "white", "darkred"))
+
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_blue_and_red.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun1,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_blue_and_red_scale2.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun2,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+png(file.path(plot_dir, "heatmap_phenograph_cxcr5_envp8_blue_and_red_scale3.png"), height=400, width=550)
+Heatmap(t(cluster_mfi_median),
+        name = "Median marker intensity",
+        col = col_fun3,
+        show_column_names = TRUE,  
+        top_annotation = col_anno)
+invisible(dev.off())
+
+```
+
+
+```{r investigate_phenograph_clusters_cxcr5_envp8}
+#Make plots over all clusters 
+
+for(selected_cluster in levels(cxcr5_envp8_z_scores_df$cluster_pg)){
+  
+cluster_cell_counts <- cxcr5_envp8_z_scores_df %>% 
+  dplyr::filter(day != "D0" & day != "D7") %>%
+  dplyr::group_by(subject, day) %>%
+  dplyr::summarise(cluster_count = sum(cluster_pg == selected_cluster),
+                   num_cells = n()) %>%
+  dplyr::mutate(cluster_percent = cluster_count/num_cells*100)
+
+y_title <- paste0("% of CXCR5+, Envp8-specific cells\nin", selected_cluster)
+fig_filename <-paste0(selected_cluster ,"CXCR5_Envp8_vs_day.png") 
+  
+ggplot(cluster_cell_counts, aes(x=day, y=cluster_count, color=subject))+
+  geom_quasirandom()+
+  scale_color_manual(values = subject_cols)+
+  labs(x="", y="number of cluster cells")+
+  theme(text = element_text(size=16))
+
+g_cluster <- ggplot(cluster_cell_counts, aes(x=day, y=cluster_percent, color=subject, group=subject))+
+  #geom_point(size=2.5)+
+  geom_line()+
+  scale_color_manual(values = subject_cols)+
+  stat_summary(aes(x=day, y = cluster_percent, group =1), fun.y = mean, geom="line", size = 2)+
+  labs(x="", y=y_title)+
+  theme(text = element_text(size=18))
+
+
+filename <- file.path(plot_dir, fig_filename)
+  png(filename, height=400, width=600)
+  print(g_cluster)
+  invisible(dev.off())
+  
+}
+```
+
+```{r get CXCR5 percent data}
+#Read in markers % positive summary compiled previously from Quinn's spreadsheets. 
+percent_pos_data <- read.csv(file.path(base_dir, "Hannah", "YFV_percent_positive_long_format.csv"))
+  
+percent_pos_data <- dplyr::rename(percent_pos_data, subject = donor)
+percent_pos_data$tmr_group <- percent_pos_data$tmr
+percent_pos_data$tmr_group[str_detect(percent_pos_data$tmr,"ns1|ns3|envp8")] <- "yfv"
+percent_pos_data$day <- factor(percent_pos_data$day, levels = c("D0", "D7", "D14", "D28", "D60", "D90", "1YR"))
+
+percent_pos_data_summary <- percent_pos_data %>%
+  dplyr::filter(tmr_group == "yfv") %>%
+  dplyr::filter(day != "D0" & day != "D7") %>%
+  dplyr::group_by(day, tmr, marker) %>%
+  dplyr::summarise(tmr_mean = mean(percent_pos, na.rm=T), tmr_sd = sd(percent_pos, na.rm=T), tmr_median = median (percent_pos, na.rm=T))
+
+percent_pos_cxcr5 <- percent_pos_data[percent_pos_data$marker == "CXCR5",]
+percent_pos_cxcr5_summary <- percent_pos_data_summary[percent_pos_data_summary$marker == "CXCR5",]
+
+pd <- position_dodge(0.5) # set how far to offset points in plot below
+
+g_percent_pos_cxcr5 <- ggplot(data = percent_pos_cxcr5_summary, aes(x=day, y=tmr_mean, colour=tmr, group=tmr)) + 
+  geom_errorbar(aes(ymin=tmr_mean-tmr_sd, ymax=tmr_mean+tmr_sd), width=.25, position=pd) +
+  geom_line(position=pd, size=1) +
+  geom_point(position=pd) +
+  scale_color_manual(values = tmr_cols)+
+  labs(x="", y="% CXCR5+ cells", color="")+
+  theme(text = element_text(size=18))+
+  guides(colour = guide_legend(override.aes = list(size=3.5)))
+
+filename <- file.path(plot_dir, "yfv_cxcr5_tmr_freq_by_day.png")
+  png(filename, height=400, width=600)
+  print(g_percent_pos_cxcr5)
+  invisible(dev.off())
+  
+#Run stat tests over cxcr5 for each day
+
+two_group_percent_pos <- function(tmr1, tmr2, tmr1_percents, tmr2_percents){
+
+  #Are the same subjects present in each group for each day?
+  if(all(sort(tmr1_percents$subject) == sort(tmr2_percents$subject))){
+    #Make sure the rows are in the same order
+    tmr1_percents <- tmr1_percents[order(tmr1_percents$subject),]
+    tmr2_percents <- tmr2_percents[order(tmr2_percents$subject),]
+    
+    test <- wilcox.test(tmr1_percents$percent_pos, tmr2_percents$percent_pos, 
+                        alternative = "two.sided",
+                        paired = TRUE)
+    print(test)
+    
+    test_results <- c("day" = selected_day, 
+                      "comparison" = paste0(tmr1,"_vs_",tmr2), 
+                      "p_val" = test$p.value)
+    
+    
+  }else{
+    #Don't run a test if the data can't be paired
+    test_results <- c("day" = selected_day, 
+                      "comparison" = paste0(tmr1,"_vs_",tmr2), 
+                      "p_val" = NA)
+  } #end if else
+
+  return(test_results)
+  } #end function   
+
+#Initialize a place to store test data
+test_summary_cxcr5 <- data.frame("day"=character(),
+                           "comparison" = character(),
+                           "p_val" = numeric())
+
+for(selected_day in levels(percent_pos_cxcr5$day)) {
+  
+  envp8_percents <- percent_pos_cxcr5[percent_pos_cxcr5$tmr == "envp8" & percent_pos_cxcr5$day == selected_day,]
+  ns1_percents <- percent_pos_cxcr5[percent_pos_cxcr5$tmr == "ns1"& percent_pos_cxcr5$day == selected_day,]
+  ns3_percents <- percent_pos_cxcr5[percent_pos_cxcr5$tmr == "ns3"& percent_pos_cxcr5$day == selected_day,]
+  
+  #Run two-group comparisons
+  #Make sure the same subjects are present in each, in the same order for paired tests
+  
+  envp8_vs_ns1 <- two_group_percent_pos("envp8", "ns1", envp8_percents, ns1_percents)
+  envp8_vs_ns3 <- two_group_percent_pos("envp8", "ns3", envp8_percents, ns3_percents)
+  ns1_vs_ns3 <- two_group_percent_pos("ns1", "ns3", ns1_percents, ns3_percents)
+
+  test_summary_cxcr5 <- rbind(test_summary_cxcr5, t(envp8_vs_ns1), t(envp8_vs_ns3), t(ns1_vs_ns3))
+
+} 
+
+```
